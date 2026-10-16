@@ -224,6 +224,16 @@ local ai_instance_schema = {
                 description = "Per-instance minimum cosine similarity for the "
                     .. "semantic algorithm; overrides semantic_opts.threshold.",
             },
+            description = {
+                type = "string",
+                minLength = 1,
+                maxLength = 4096,
+                description = "Routing role of this instance for the system_one "
+                    .. "algorithm: which requests it should receive, in plain "
+                    .. "language. Sent to the System One model as the criterion "
+                    .. "of this instance's option. Required for every instance "
+                    .. "when the balancer algorithm is system_one.",
+            },
         },
         required = {"name", "provider", "auth", "weight"},
     },
@@ -310,6 +320,83 @@ local semantic_opts_schema = {
         },
     },
     required = { "embeddings" },
+}
+
+-- All options specific to the system_one balancer.
+local system_one_opts_schema = {
+    type = "object",
+    properties = {
+        endpoint = {
+            type = "string",
+            description = "URL of the System One API, e.g. "
+                .. "https://api.typesafe.ai/v1/systemone. Without a path, the "
+                .. "API's path /v1/systemone is used.",
+        },
+        model = {
+            type = "string",
+            minLength = 1,
+            description = "System One model that ranks the instances, e.g. "
+                .. "jev-latest.",
+        },
+        auth = {
+            type = "object",
+            properties = {
+                header = { type = "object", additionalProperties = { type = "string" } },
+                query = { type = "object", additionalProperties = { type = "string" } },
+            },
+            -- header/query only, as for semantic_opts.embeddings: the call runs
+            -- outside the client request, so ctx-dependent schemes cannot work.
+            additionalProperties = false,
+            description = "Authentication headers or query parameters of the "
+                .. "System One request.",
+        },
+        instructions = {
+            type = "string",
+            minLength = 1,
+            description = "Instructions of the routing question. Defaults to a "
+                .. "generic instruction to pick the best-suited instance.",
+        },
+        threshold = {
+            type = "number",
+            minimum = 0,
+            maximum = 1,
+            default = 0,
+            description = "Minimum probability the System One model must assign "
+                .. "to an instance for it to be picked, also on retries. When no "
+                .. "available instance clears it, the request goes to the "
+                .. "`fallback` instance, or the first instance if none is named.",
+        },
+        fallback = {
+            type = "string",
+            minLength = 1,
+            description = "Name of the instance to route to when the System One "
+                .. "request fails or no instance clears the threshold. It is "
+                .. "otherwise a normal ranked instance and needs a `description` "
+                .. "like the rest. Defaults to the first instance when unset.",
+        },
+        timeout = {
+            type = "integer",
+            minimum = 1,
+            default = 3000,
+            description = "System One request timeout in milliseconds. The call "
+                .. "is made synchronously on every request, so this bounds the "
+                .. "latency added when the endpoint is slow or down (the request "
+                .. "then fails open to the fallback).",
+        },
+        ssl_verify = {
+            type = "boolean",
+            default = true,
+            description = "Verify the TLS certificate of the System One API.",
+        },
+        debugging = {
+            type = "boolean",
+            default = false,
+            description = "When true, expose the per-instance probabilities and "
+                .. "the picked instance via X-AI-System-One-* response headers, "
+                .. "for debugging.",
+        },
+    },
+    required = { "endpoint", "model" },
 }
 
 local logging_schema = {
@@ -407,7 +494,7 @@ _M.ai_proxy_multi_schema = {
             properties = {
                 algorithm = {
                     type = "string",
-                    enum = { "chash", "roundrobin", "semantic" },
+                    enum = { "chash", "roundrobin", "semantic", "system_one" },
                     description = "Load-balancing algorithm. Note: 'semantic' "
                         .. "picks an instance by prompt similarity and does not "
                         .. "participate in health checks or fallback_strategy / "
@@ -415,7 +502,12 @@ _M.ai_proxy_multi_schema = {
                         .. "returned to the client. It only falls back (to the "
                         .. "semantic_opts.fallback, else the first instance) when "
                         .. "no instance clears its threshold or embedding fails. "
-                        .. "Configure it under `semantic_opts`.",
+                        .. "Configure it under `semantic_opts`. 'system_one' asks "
+                        .. "a System One model to rank the instances by their "
+                        .. "`description`, picks the most probable available "
+                        .. "instance, and retries down the ranking on "
+                        .. "fallback_strategy errors. Configure it under "
+                        .. "`system_one_opts`.",
                 },
                 hash_on = {
                     type = "string",
@@ -437,6 +529,7 @@ _M.ai_proxy_multi_schema = {
         },
         instances = ai_instance_schema,
         semantic_opts = semantic_opts_schema,
+        system_one_opts = system_one_opts_schema,
         logging = logging_schema,
         fallback_strategy = {
             anyOf = {
@@ -555,6 +648,8 @@ _M.ai_proxy_multi_schema = {
         "instances.auth.aws.session_token",
         "semantic_opts.embeddings.auth.header",
         "semantic_opts.embeddings.auth.query",
+        "system_one_opts.auth.header",
+        "system_one_opts.auth.query",
     },
 }
 

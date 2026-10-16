@@ -72,7 +72,7 @@ import TabItem from '@theme/TabItem';
 | max_retries                        | integer        | 否    |                                   | 大于或等于 0 | 初始请求失败后允许的最大故障转移重试次数。用于限制单个请求最多尝试多少个额外实例，避免穷举所有已配置的实例。仅在配置 `fallback_strategy` 或 `fallback_http_statuses` 时生效。未设置时，插件会持续重试直到某个实例成功或所有实例都已尝试。 |
 | retry_on_failure_within_ms         | integer        | 否    |                                   | 大于或等于 1 | 仅当上游在指定毫秒数内失败时才故障转移到其他实例。快速失败（如连接错误、快速返回的 `429`/`5xx`）会触发重试，而耗时超过该值的慢失败会直接将错误返回给客户端，避免客户端等待时间翻倍。仅在配置 `fallback_strategy` 或 `fallback_http_statuses` 时生效。未设置时，插件无论失败请求耗时多久都会重试。 |
 | balancer                           | object         | 否    |                                   |              | 负载均衡配置。 |
-| balancer.algorithm                 | string         | 否    | roundrobin                     | [roundrobin, chash, semantic] | 负载均衡算法。设置为 `roundrobin` 时，使用加权轮询算法。设置为 `chash` 时，使用一致性哈希算法。设置为 `semantic` 时，插件根据请求提示词与各实例 `examples` 之间的语义相似度选择实例，其相关选项配置在 `semantic_opts` 下。注意：`semantic` 不参与健康检查，也不参与 `fallback_strategy` / 重试——被选中实例的上游失败会直接返回给客户端；只有当没有实例达到其阈值或嵌入请求失败时，才会回退（回退到 `semantic_opts.fallback` 实例，若未配置则回退到第一个实例）。 |
+| balancer.algorithm                 | string         | 否    | roundrobin                     | [roundrobin, chash, semantic, system_one] | 负载均衡算法。设置为 `roundrobin` 时，使用加权轮询算法。设置为 `chash` 时，使用一致性哈希算法。设置为 `semantic` 时，插件根据请求提示词与各实例 `examples` 之间的语义相似度选择实例，其相关选项配置在 `semantic_opts` 下。注意：`semantic` 不参与健康检查，也不参与 `fallback_strategy` / 重试——被选中实例的上游失败会直接返回给客户端；只有当没有实例达到其阈值或嵌入请求失败时，才会回退（回退到 `semantic_opts.fallback` 实例，若未配置则回退到第一个实例）。设置为 `system_one` 时，插件请 System One 模型根据各实例的 `description` 对实例进行排序，并选择概率最高的可用实例，其相关选项配置在 `system_one_opts` 下。与 `semantic` 不同，`system_one` 会跳过健康检查失败或被限流的实例，并在出现 `fallback_strategy` 错误时按排序重试下一个实例。 |
 | balancer.hash_on                   | string         | 否    |                                   | [vars, headers, cookie, consumer, vars_combinations] | 当 `type` 为 `chash` 时使用。支持基于 [NGINX 变量](https://nginx.org/en/docs/varindex.html)、标头、cookie、消费者或 [NGINX 变量](https://nginx.org/en/docs/varindex.html)组合进行哈希。 |
 | balancer.key                       | string         | 否    |                                   |              | 当 `type` 为 `chash` 时使用。当 `hash_on` 设置为 `header` 或 `cookie` 时，需要 `key`。当 `hash_on` 设置为 `consumer` 时，不需要 `key`，因为消费者名称将自动用作键。 |
 | instances                          | array[object]  | 是     |                                   |              | LLM 实例配置。 |
@@ -104,6 +104,7 @@ import TabItem from '@theme/TabItem';
 | instances.override.request_body_force_override | boolean | 否 | false |                            | 为 `false`（默认）时，客户端请求体中的字段优先，`instances.override.request_body` 仅补充缺失字段。为 `true` 时，`instances.override.request_body` 的值强制覆盖客户端请求体中的同名字段。不影响 `instances.override.llm_options`。 |
 | instances.examples                  | array[string]  | 否    |                                   | 1 到 64 项 | 当 `algorithm` 为 `semantic` 时使用。代表该实例意图的示例语句；每一条都会被嵌入为独立的参考向量。当 `algorithm` 为 `semantic` 时每个实例都必填，包括被 `semantic_opts.fallback` 指定的实例。 |
 | instances.threshold                 | number         | 否    |                                   | -1 到 1      | 当 `algorithm` 为 `semantic` 时使用。该实例的最小余弦相似度，覆盖 `semantic_opts.threshold`。 |
+| instances.description               | string         | 否    |                                   | 1 到 4096 个字符 | 当 `algorithm` 为 `system_one` 时使用。用自然语言描述的实例路由角色，例如 `Debugging existing code and reviewing patches.`。它会作为该实例选项的判断标准发送给 System One 模型。当 `algorithm` 为 `system_one` 时每个实例都必填，包括被 `system_one_opts.fallback` 指定的实例。 |
 | logging                             | object         | 否    |                                   |              | 日志配置。不影响 `error.log`。 |
 | logging.summaries                   | boolean        | 否    | false                           |              | 如果为 true，记录请求 LLM 模型、持续时间、请求和响应令牌。 |
 | logging.payloads                    | boolean        | 否    | false                           |              | 如果为 true，记录请求和响应负载。 |
@@ -140,6 +141,18 @@ import TabItem from '@theme/TabItem';
 | semantic_opts.embeddings.auth.query | object         | 否    |                                   |              | 认证查询参数。加密存储。 |
 | semantic_opts.embeddings.timeout    | integer        | 否    | 3000                            | 最小值为 1  | 嵌入请求的超时时间（毫秒）。每个请求都会同步嵌入查询提示词，因此该值限定了当嵌入端点变慢或不可用时每个请求增加的延迟上限（随后请求会 fail-open 到回退实例）。 |
 | semantic_opts.embeddings.ssl_verify | boolean        | 否    | true                            |              | 如果为 true，验证嵌入服务的证书。 |
+| system_one_opts                     | object         | 否    |                                   |              | `system_one` 均衡器的选项。当 `balancer.algorithm` 为 `system_one` 时必填。 |
+| system_one_opts.endpoint            | string         | 是    |                                   |              | System One API 的 URL，例如 `https://api.typesafe.ai/v1/systemone`。若 URL 不含路径，则使用 `/v1/systemone`。 |
+| system_one_opts.model               | string         | 是    |                                   |              | 对实例进行排序的 System One 模型，例如 `jev-latest`。 |
+| system_one_opts.auth                | object         | 否    |                                   |              | System One API 的认证配置。 |
+| system_one_opts.auth.header         | object         | 否    |                                   |              | 认证请求头。加密存储。 |
+| system_one_opts.auth.query          | object         | 否    |                                   |              | 认证查询参数。加密存储。 |
+| system_one_opts.instructions        | string         | 否    |                                   |              | 路由问题的指令。默认使用一条通用指令，要求选择最合适的实例。 |
+| system_one_opts.threshold           | number         | 否    | 0                               | 0 到 1       | 实例被选中所需的最小概率。当没有可用实例达到该值时，请求回退到 `fallback` 实例；若未指定，则回退到第一个实例。重试时同样适用：只有当排序中的下一个实例达到阈值时才会重试该实例，否则重试 `fallback` 实例。 |
+| system_one_opts.fallback            | string         | 否    |                                   |              | 当 System One 请求失败或没有实例达到阈值时，路由到的实例名称。它本身也是一个参与排名的普通实例，同样需要配置 `description`。未设置时默认回退到第一个实例。 |
+| system_one_opts.timeout             | integer        | 否    | 3000                            | 最小值为 1  | System One 请求的超时时间（毫秒）。每个请求都会同步调用 System One API，因此该值限定了当端点变慢或不可用时每个请求增加的延迟上限（随后请求会 fail-open 到回退实例）。 |
+| system_one_opts.ssl_verify          | boolean        | 否    | true                            |              | 如果为 true，验证 System One API 的证书。 |
+| system_one_opts.debugging           | boolean        | 否    | false                           |              | 若为 true，通过 `X-AI-System-One-Probabilities` 和 `X-AI-System-One-Picked-Instance` 响应头暴露各实例的概率和路由决策，用于调试。 |
 | timeout                             | integer        | 否    | 30000                           | 大于或等于 1 | 请求 LLM 服务时的请求超时时间（毫秒）。应用于单次 socket 操作（连接 / 发送 / 读取块），不限制流式响应的总时长。 |
 | max_stream_duration_ms              | integer        | 否    |                                 | 大于或等于 1 | 流式 AI 响应的总墙钟时长上限（毫秒）。若上游在此时间后仍持续发送数据，网关将关闭连接。未设置时不限制。用于防护上游持续输出 token 导致网关 CPU 被打满的异常情况。中途触发上限时，下游 SSE 流会被截断（不再发送协议特定的终止标记，例如 `[DONE]`、`message_stop` 或 `response.completed`），客户端应将缺失的终止标记视为响应未完成。 |
 | max_response_bytes                  | integer        | 否    |                                 | 大于或等于 1 | 单次 AI 响应（流式或非流式）允许从上游读取的最大总字节数。超出时关闭连接。非流式响应若存在 `Content-Length`，在读取 body 之前预检；否则（chunked 传输）与流式响应一样在接收字节的过程中增量检查。未设置时不限制。 |
@@ -2937,3 +2950,142 @@ semantic routing: no instance cleared threshold (scores: code:0.3057,translate:0
 如果开启了 `debugging` 却完全没有这两个响应头，说明嵌入请求本身失败了，请求在计算任何得分之前就已回退到回退实例，失败原因会以 `warn` 级别记录。
 
 由于 `debugging` 会向调用方暴露实例名称，生产环境应保持关闭，改用日志排查。
+
+### 使用 System One 模型路由
+
+以下示例演示了如何使用 `system_one` 算法，让 System One 模型为每个请求选择实例。System One 模型（例如 TypeSafe 的 Jev）是一种判别式模型：它不生成文本，而是针对输入回答类型化的问题并返回概率分布，通过 [System One API](https://docs.typesafe.ai/api)（`POST /v1/systemone`）提供服务。插件将请求提示词作为 `state` 发送，并提出一个 `choice` 类型的问题，其选项是各实例的名称，每个选项由实例的 `description` 描述。随后插件将请求转发给概率最高、健康且未被限流的实例。该算法不使用实例的 `weight` 和 `priority`。
+
+与 `semantic` 相比，路由策略是每个实例的自然语言描述，而不是一组示例提示词，并且不需要嵌入模型。由于模型会为每个实例给出概率，插件可以跳过不健康或被限流的实例，并在下一个概率最高的实例上重试。
+
+创建如下路由，并相应地更新 LLM 提供商、System One 端点和模型以及 API 密钥。`default` 实例被指定为 `system_one_opts.fallback`，当 System One 请求失败或没有实例达到阈值时兜底：
+
+```shell
+curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
+  -H "X-API-KEY: ${admin_key}" \
+  -d '{
+    "id": "ai-proxy-multi-route",
+    "uri": "/anything",
+    "methods": ["POST"],
+    "plugins": {
+      "ai-proxy-multi": {
+        "balancer": {
+          "algorithm": "system_one"
+        },
+        "system_one_opts": {
+          "endpoint": "https://api.typesafe.ai/v1/systemone",
+          "model": "jev-latest",
+          "auth": {
+            "header": {
+              "Authorization": "Bearer '"$YOUR_SYSTEM_ONE_API_KEY"'"
+            }
+          },
+          "threshold": 0.3,
+          "fallback": "default"
+        },
+        "fallback_strategy": ["http_429", "http_5xx"],
+        "instances": [
+          {
+            "name": "code",
+            "provider": "openai",
+            "weight": 1,
+            "auth": {
+              "header": {
+                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
+              }
+            },
+            "options": {
+              "model": "gpt-4o"
+            },
+            "description": "Writing, debugging and reviewing code."
+          },
+          {
+            "name": "translate",
+            "provider": "openai",
+            "weight": 1,
+            "auth": {
+              "header": {
+                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
+              }
+            },
+            "options": {
+              "model": "gpt-4o-mini"
+            },
+            "description": "Translating and summarizing text."
+          },
+          {
+            "name": "default",
+            "provider": "openai",
+            "weight": 1,
+            "auth": {
+              "header": {
+                "Authorization": "Bearer '"$YOUR_LLM_API_KEY"'"
+              }
+            },
+            "options": {
+              "model": "gpt-4o-mini"
+            },
+            "description": "General questions and conversation with no specialist need."
+          }
+        ]
+      }
+    }
+  }'
+```
+
+发送一个编程类提示词的请求：
+
+```shell
+curl "http://127.0.0.1:9080/anything" -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [
+      { "role": "user", "content": "help me debug this python code" }
+    ]
+  }'
+```
+
+请求应被路由到 `code` 实例，并由 `gpt-4o` 处理。如果 `code` 实例返回 `429` 或 `5xx` 状态码，请求会在下一个达到 `threshold` 且概率最高的实例上重试，否则在回退实例 `default` 上重试，而不会再次询问 System One 模型。每个实例在一个请求中最多尝试一次，`max_retries` 和 `retry_on_failure_within_ms` 的作用与其他算法相同。
+
+插件发送给 System One API 的请求类似如下，其中提示词最多截取 16 KiB：
+
+```json
+{
+  "model": "jev-latest",
+  "state": "help me debug this python code",
+  "questions": {
+    "instance": {
+      "type": "choice",
+      "instructions": "Choose the option best suited to answer this request. ...",
+      "criteria": {
+        "code": "Writing, debugging and reviewing code.",
+        "translate": "Translating and summarizing text.",
+        "default": "General questions and conversation with no specialist need."
+      }
+    }
+  }
+}
+```
+
+插件根据响应中的 `answers.instance.probabilities` 对实例按概率从高到低排序；概率分布中缺失的实例概率为 0。其他任何响应都会使请求路由到回退实例。
+
+#### 调试路由决策
+
+将 `system_one_opts.debugging` 设置为 `true`，插件会报告每个实例的概率以及最终选择的实例：
+
+```text
+HTTP/1.1 200 OK
+X-AI-System-One-Picked-Instance: code
+X-AI-System-One-Probabilities: code:0.9100,default:0.0600,translate:0.0300
+```
+
+`X-AI-System-One-Probabilities` 按概率从高到低列出所有实例，可据此校准 `threshold` 和各实例的 `description`。发生重试后，`X-AI-System-One-Picked-Instance` 为最终处理请求的实例。
+
+当 System One 请求失败，或没有可用实例达到阈值时，插件会以 `warn` 级别记录原因，并路由到回退实例：
+
+```text
+system_one routing: system one request failed: request: timeout, falling back
+system_one routing: no available instance cleared the threshold, falling back to default
+```
+
+由于 `debugging` 会向调用方暴露实例名称，生产环境中请保持关闭，改用日志进行排查。

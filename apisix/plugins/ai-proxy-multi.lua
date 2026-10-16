@@ -26,6 +26,7 @@ local resource = require("apisix.resource")
 local exporter = require("apisix.plugins.prometheus.exporter")
 local tonumber = tonumber
 local pairs = pairs
+local next = next
 local table_sort = table.sort
 local table_concat = table.concat
 local math_random = math.random
@@ -45,6 +46,7 @@ local url = require("socket.url")
 local priority_balancer = require("apisix.balancer.priority")
 local semantic = require("apisix.plugins.ai-proxy.semantic")
 local embedding = require("apisix.plugins.ai-proxy.embedding")
+local system_one = require("apisix.plugins.ai-proxy.system-one")
 local ai_protocols = require("apisix.plugins.ai-protocols")
 local endpoint_regex = "^(https?)://([^:/]+):?(%d*)/?.*$"
 
@@ -95,6 +97,12 @@ local function fallback_strategy_has(strategy, name)
     end
 
     return false
+end
+
+
+local function rate_limiting_enabled(conf)
+    return conf.fallback_strategy == "instance_health_and_rate_limiting" or
+           fallback_strategy_has(conf.fallback_strategy, "rate_limiting")
 end
 
 
@@ -252,6 +260,34 @@ function _M.check_schema(conf)
         if fallback and not fallback_found then
             return false, "`semantic_opts.fallback` names unknown instance '" ..
                 fallback .. "'"
+        end
+    end
+
+    if algo == "system_one" then
+        local opts = conf.system_one_opts
+        if not opts then
+            return false, "must configure `system_one_opts` when balancer " ..
+                "algorithm is system_one"
+        end
+        local scheme, host = opts.endpoint:match(endpoint_regex)
+        if not scheme or not host then
+            return false, "invalid `system_one_opts.endpoint`"
+        end
+        -- Every instance is an option of the System One question, so each needs
+        -- the criterion the model ranks it by. The fallback is ranked too.
+        local fallback_found = false
+        for _, instance in ipairs(conf.instances) do
+            if opts.fallback and instance.name == opts.fallback then
+                fallback_found = true
+            end
+            if not instance.description then
+                return false, "instance '" .. instance.name ..
+                    "': must configure `description` for the system_one algorithm"
+            end
+        end
+        if opts.fallback and not fallback_found then
+            return false, "`system_one_opts.fallback` names unknown instance '" ..
+                opts.fallback .. "'"
         end
     end
 
@@ -616,11 +652,13 @@ local function get_instance_conf(instances, name)
 end
 
 
-local function pick_target(ctx, conf, ups_tab)
+-- The health checker of every instance that configures active checks, keyed by
+-- instance name.
+local function fetch_checkers(conf)
     local checkers = {}
     local res_conf = resource.fetch_latest_conf(conf._meta.parent.resource_key)
     if not res_conf then
-        return nil, nil, "failed to fetch the parent config"
+        return nil, "failed to fetch the parent config"
     end
     local instances = res_conf.value.plugins[plugin_name].instances
     for i, instance in ipairs(conf.instances) do
@@ -637,6 +675,15 @@ local function pick_target(ctx, conf, ups_tab)
             local checker = healthcheck_manager.fetch_checker(resource_path, resource_version)
             checkers[instance.name] = checker
         end
+    end
+    return checkers
+end
+
+
+local function pick_target(ctx, conf, ups_tab)
+    local checkers, cerr = fetch_checkers(conf)
+    if not checkers then
+        return nil, nil, cerr
     end
 
     local health_status
@@ -658,8 +705,7 @@ local function pick_target(ctx, conf, ups_tab)
     ctx.server_picker = server_picker
 
     local ai_rate_limiting
-    local check_rate_limiting = conf.fallback_strategy == "instance_health_and_rate_limiting" or
-                                fallback_strategy_has(conf.fallback_strategy, "rate_limiting")
+    local check_rate_limiting = rate_limiting_enabled(conf)
     if check_rate_limiting then
         ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
     end
@@ -891,10 +937,136 @@ local function pick_semantic_instance(ctx, conf)
 end
 
 
+-- Ask the System One model once per request and keep the ranking, so retries
+-- walk down it instead of asking again. Without a usable ranking (no prompt,
+-- request failed, malformed answer) the ranking is empty and every pick takes
+-- the fallback order.
+local function system_one_ranking(ctx, conf)
+    local ranking = ctx.ai_system_one_ranking
+    if ranking then
+        return ranking
+    end
+
+    local opts = conf.system_one_opts
+    local err
+    local prompt = extract_last_user_message(ctx)
+    if not prompt then
+        err = "no user message found"
+    else
+        -- pcall: the response is provider-controlled, so a raise here must fall
+        -- back rather than 500.
+        local ok, res, ferr = pcall(system_one.fetch, opts, prompt, conf.instances)
+        if not ok then
+            err = res
+        elseif not res then
+            err = ferr
+        else
+            ranking = res
+        end
+    end
+
+    if ranking then
+        if opts.debugging then
+            local parts = core.table.new(#ranking, 0)
+            for i, c in ipairs(ranking) do
+                parts[i] = c.name .. ":" .. str_format("%.4f", c.probability)
+            end
+            core.response.set_header("X-AI-System-One-Probabilities",
+                                     table_concat(parts, ","))
+        end
+    else
+        core.log.warn("system_one routing: ", err, ", falling back")
+        ranking = {}
+    end
+
+    ctx.ai_system_one_ranking = ranking
+    ctx.ai_system_one_tried = {}
+    return ranking
+end
+
+
+-- Pick the first available instance in this order: the ranked instances that
+-- clear the threshold, most probable first, then the fallback instance, then
+-- the others in configured order. An instance is available when it has not been
+-- tried in this request, is not marked unhealthy by its active health check and
+-- is not rate limited.
+local function pick_system_one_instance(ctx, conf)
+    local opts = conf.system_one_opts
+    local ranking = system_one_ranking(ctx, conf)
+    local tried = ctx.ai_system_one_tried
+
+    local checkers, err = fetch_checkers(conf)
+    if not checkers then
+        return nil, nil, err
+    end
+    local health_status
+    if next(checkers) then
+        health_status = fetch_health_status(conf, checkers, ctx.matched_route.key,
+                                            plugin.conf_version(conf))
+    end
+    local ai_rate_limiting
+    if rate_limiting_enabled(conf) then
+        ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
+    end
+
+    local order = {}
+    for _, cand in ipairs(ranking) do
+        if cand.probability >= opts.threshold then
+            order[#order + 1] = cand.name
+        end
+    end
+    local ranked = #order
+    order[#order + 1] = opts.fallback or conf.instances[1].name
+    for _, inst in ipairs(conf.instances) do
+        order[#order + 1] = inst.name
+    end
+
+    local picked, picked_at
+    local checked = {}
+    for i, name in ipairs(order) do
+        if not tried[name] and not checked[name] then
+            checked[name] = true
+            if health_status and health_status[name] == false then
+                core.log.warn("system_one routing: instance ", name, " is unhealthy")
+            elseif ai_rate_limiting and
+                   not ai_rate_limiting.check_instance_status(nil, ctx, name) then
+                core.log.warn("system_one routing: instance ", name, " is rate limited")
+            else
+                picked, picked_at = name, i
+                break
+            end
+        end
+    end
+
+    if not picked then
+        return nil, nil, "all servers tried"
+    end
+    if picked_at > ranked and #ranking > 0 then
+        core.log.warn("system_one routing: no ", next(tried) and "untried " or "",
+                      "available instance cleared the threshold, falling back to ",
+                      picked)
+    end
+    tried[picked] = true
+
+    if opts.debugging then
+        core.response.set_header("X-AI-System-One-Picked-Instance", picked)
+    end
+    core.log.info("system_one routing picked instance: ", picked)
+
+    local instance_conf = get_instance_conf(conf.instances, picked)
+    local nodes = instance_conf._healthy_dns_nodes or instance_conf._dns_nodes
+    use_node_for_request(instance_conf, pick_request_node(nodes))
+    return picked, instance_conf
+end
+
+
 local function pick_ai_instance(ctx, conf, ups_tab)
     local instance_name, instance_conf, err
-    if conf.balancer and conf.balancer.algorithm == "semantic" then
+    local algorithm = conf.balancer and conf.balancer.algorithm
+    if algorithm == "semantic" then
         instance_name, instance_conf = pick_semantic_instance(ctx, conf)
+    elseif algorithm == "system_one" then
+        instance_name, instance_conf, err = pick_system_one_instance(ctx, conf)
     elseif #conf.instances == 1 then
         instance_name = conf.instances[1].name
         instance_conf = conf.instances[1]
@@ -937,10 +1109,11 @@ end
 
 
 local function retry_on_error(ctx, conf, code, body)
-    if not ctx.server_picker then
+    if ctx.server_picker then
+        ctx.server_picker.after_balance(ctx, true)
+    elseif not ctx.ai_system_one_ranking then
         return code
     end
-    ctx.server_picker.after_balance(ctx, true)
     if (code == 429 and fallback_strategy_has(conf.fallback_strategy, "http_429")) or
        (code >= 500 and code < 600 and
        fallback_strategy_has(conf.fallback_strategy, "http_5xx")) or
